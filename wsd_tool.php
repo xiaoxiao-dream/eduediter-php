@@ -12,57 +12,93 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['wsd_file'])) {
     $tmpPath = $uploadFile['tmp_name'];
 
     /**
-     * WSD启发式解析 提取UTF‑16LE
+     * WSD启发式解析 提取UTF-16LE
      */
     function parseWsdHeuristic(string $filePath): array
     {
         $fp = fopen($filePath, 'rb');
         if (!$fp) return ['ok' => false, 'msg' => '打开文件失败'];
+        // EduEditer versions may place the legacy marker after a small header,
+        // so do not reject a file only because the marker is not at byte zero.
         $magicExpect = "\x00WSTUDIO5";
-        $headBuf = fread($fp, 9);
-        if (strncmp($headBuf, $magicExpect, 9) !== 0) {
+        $headBuf = fread($fp, 256);
+        if ($headBuf === false || strlen($headBuf) === 0) {
             fclose($fp);
-            return ['ok' => false, 'msg' => '不是WSTUDIO5 wsd文件'];
+            return ['ok' => false, 'msg' => '文件为空或无法读取'];
         }
+        $markerPos = strpos($headBuf, $magicExpect);
+        $headerSkip = ($markerPos === false) ? 0 : $markerPos + strlen($magicExpect);
         fseek($fp, 0);
         $chunkSize = 8192;
         $buffer = '';
         $outputLines = [];
+        $headerSkipped = false;
+        $scanOffset = $headerSkip % 2;
         while (!feof($fp)) {
             $raw = fread($fp, $chunkSize);
+            if ($raw === false || $raw === '') continue;
             $buffer .= $raw;
-            $bufLen = strlen($buffer);
-            $i = 0;
-            while ($i <= $bufLen - 2) {
-                $b1 = ord($buffer[$i]);
-                $b2 = ord($buffer[$i + 1]);
-                if ($b1 === 0 && $b2 === 0) {
-                    $i += 2;
-                    continue;
-                }
-                $startPos = $i;
-                while (($i + 1) < $bufLen && !(ord($buffer[$i]) === 0 && ord($buffer[$i + 1]) === 0)) {
-                    $i += 2;
-                }
-                $slice = substr($buffer, $startPos, $i - $startPos);
-                $str = iconv("UTF‑16LE", "UTF‑8//IGNORE", $slice);
-                $str = trim($str);
-                if ($str !== '') $outputLines[] = $str;
+            if (!$headerSkipped && ($headerSkip === 0 || strlen($buffer) >= $headerSkip)) {
+                if ($headerSkip > 0) $buffer = substr($buffer, $headerSkip);
+                $headerSkipped = true;
             }
-            $buffer = substr($buffer, -2);
+            $processable = strlen($buffer) - 512;
+            if ($processable <= 0 && !feof($fp)) continue;
+            $scan = $processable > 0 ? substr($buffer, 0, $processable) : $buffer;
+            $buffer = $processable > 0 ? substr($buffer, $processable) : '';
+            $scanLen = strlen($scan);
+            for ($offset = $scanOffset; $offset < $scanOffset + 1; $offset++) {
+                $run = '';
+                for ($i = $offset; $i + 1 < $scanLen; $i += 2) {
+                    $unit = unpack('v', substr($scan, $i, 2))[1];
+                    $valid = ($unit === 9 || $unit === 10 || $unit === 13 || ($unit >= 32 && $unit !== 0xFFFE && $unit !== 0xFFFF));
+                    if (!$valid) {
+                        if (strlen($run) >= 4) {
+                            $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
+                            if ($str !== '') $outputLines[] = $str;
+                        }
+                        $run = '';
+                        continue;
+                    }
+                    $run .= substr($scan, $i, 2);
+                }
+                if (strlen($run) >= 4) {
+                    $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
+                    if ($str !== '') $outputLines[] = $str;
+                }
+            }
+        }
+        if ($buffer !== '') {
+            for ($offset = $scanOffset; $offset < $scanOffset + 1; $offset++) {
+                $run = '';
+                for ($i = $offset; $i + 1 < strlen($buffer); $i += 2) {
+                    $unit = unpack('v', substr($buffer, $i, 2))[1];
+                    if ($unit >= 32 || $unit === 9 || $unit === 10 || $unit === 13) {
+                        $run .= substr($buffer, $i, 2);
+                    } elseif (strlen($run) >= 4) {
+                        $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
+                        if ($str !== '') $outputLines[] = $str;
+                        $run = '';
+                    }
+                }
+                if (strlen($run) >= 4) {
+                    $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
+                    if ($str !== '') $outputLines[] = $str;
+                }
+            }
         }
         fclose($fp);
+        $outputLines = array_values(array_unique($outputLines));
         $rawText = implode("\n", $outputLines);
-
         //文本清洗
-        $clean = preg_replace('/[\x00‑\x08\x0B\x0C\x0E‑\x1F]/', '', $rawText);
+        $clean = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $rawText);
         $clean = preg_replace('/\n{3,}/', "\n\n", $clean);
-        $clean = preg_replace('/\s+/', ' ', $clean);
-        return ['ok' => true, 'raw' => $rawText, 'clean' => $clean];
+        $clean = preg_replace('/[ \t]+/u', ' ', $clean);
+        return ['ok' => true, 'raw' => $rawText, 'clean' => $clean, 'headerDetected' => $headerSkip > 0];
     }
 
     /**
-     * 试卷状态机：切分题目 题号、A‑D选项、【答案】【解析】
+     * 试卷状态机：切分题目 题号、A-D选项、【答案】【解析】
      */
     function parsePaperStateMachine(string $text): array
     {
@@ -86,20 +122,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['wsd_file'])) {
             }
             if ($current === null) continue;
             //A. B. C. D.
-            if (preg_match('/^([A‑D])[\.、]/u', $line, $optm)) {
+            if (preg_match('/^([A-D])[\.、]/u', $line, $optm)) {
                 $optKey = $optm[1];
-                $optVal = preg_replace('/^([A‑D])[\.、]/u', '', $line);
+                $optVal = preg_replace('/^([A-D])[\.、]/u', '', $line);
                 $current['options'][$optKey] = $optVal;
                 continue;
             }
             //【答案】
-            if (str_starts_with($line, '【答案】')) {
-                $current['answer'] = trim(mb_substr($line, 4));
+            if (strpos($line, '【答案】') === 0) {
+                $current['answer'] = trim(preg_replace('/^【答案】/u', '', $line));
                 continue;
             }
             //【解析】
-            if (str_starts_with($line, '【解析】')) {
-                $current['analysis'] = trim(mb_substr($line, 4));
+            if (strpos($line, '【解析】') === 0) {
+                $current['analysis'] = trim(preg_replace('/^【解析】/u', '', $line));
                 continue;
             }
             //其余追加到题干
@@ -125,34 +161,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['wsd_file'])) {
 }
 ?>
 <!DOCTYPE html>
-<html lang="zh‑CN">
+<html lang="zh-CN">
 <head>
-<meta charset="UTF‑8">
-<meta name="viewport" content="width=device‑width, initial‑scale=1.0">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WSD解析工具｜单文件PHP</title>
 <script src="https://unpkg.com/mathlive@0.100.0/dist/mathlive.min.js"></script>
 <style>
-*{box-sizing:border-box;margin:0;padding:0;font‑family:system‑ui,‑apple‑system}
-body{height:100vh;display:flex;flex‑direction:column;padding:14px;gap:12px}
-.top{display:flex;gap:10px;align‑items:center;flex‑wrap:wrap}
+*{box-sizing:border-box;margin:0;padding:0;font-family:system-ui,-apple-system}
+body{height:100vh;display:flex;flex-direction:column;padding:14px;gap:12px}
+.top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 #file{display:none}
-.btn{padding:8px 14px;border‑radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;font‑size:14px}
+.btn{padding:8px 14px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
 .btn:hover{background:#1d4ed8}
 .btn.success{background:#0891b2}
-.progressWrap{width:280px;height:18px;background:#e5e7eb;border‑radius:9px;overflow:hidden}
+.progressWrap{width:280px;height:18px;background:#e5e7eb;border-radius:9px;overflow:hidden}
 #progress{height:100%;width:0%;background:#22c55e;transition:.2s}
-#status{font‑size:14px;color:#444}
+#status{font-size:14px;color:#444}
 .main{display:flex;flex:1;gap:12px;overflow:hidden}
-.leftCol{width:52%;display:flex;flex‑direction:column;border:1px solid #ddd;border‑radius:8px;overflow:hidden}
-.rightCol{width:48%;display:flex;flex‑direction:column;border:1px solid #ddd;border‑radius:8px;overflow:hidden}
-.hdr{padding:10px;background:#f3f4f6;border‑bottom:1px solid #ddd;font‑weight:500;font‑size:14px}
+.leftCol{width:52%;display:flex;flex-direction:column;border:1px solid #ddd;border-radius:8px;overflow:hidden}
+.rightCol{width:48%;display:flex;flex-direction:column;border:1px solid #ddd;border-radius:8px;overflow:hidden}
+.hdr{padding:10px;background:#f3f4f6;border-bottom:1px solid #ddd;font-weight:500;font-size:14px}
 .body{flex:1;padding:10px;overflow:auto}
-pre{white‑space:pre‑wrap;font‑size:13px;color:#222}
-table{width:100%;border‑collapse:collapse;font‑size:13px;margin‑bottom:10px}
+pre{white-space:pre-wrap;font-size:13px;color:#222}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:10px}
 th,td{border:1px solid #ccc;padding:6px}
-textarea.wide{width:100%;min‑height:100px;padding:8px;border:1px solid #ccc;border‑radius:4px;font‑size:13px}
-.math‑field{border:1px solid #bbb;padding:8px;border‑radius:6px;margin:8px 0}
-.desc{color:#b91c1c;font‑size:12px;margin:4px 0}
+textarea.wide{width:100%;min-height:100px;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:13px}
+.math-field{border:1px solid #bbb;padding:8px;border-radius:6px;margin:8px 0}
+.desc{color:#b91c1c;font-size:12px;margin:4px 0}
 </style>
 </head>
 <body>
@@ -178,8 +214,8 @@ textarea.wide{width:100%;min‑height:100px;padding:8px;border:1px solid #ccc;bo
 <div class="hdr">LaTeX可视化公式编辑器(MathLive)</div>
 <div class="body">
 <p>可视化公式：</p>
-<math‑field class="math‑field" id="mf"></math‑field>
-<p style="margin‑top:8px">LaTeX源码：</p>
+<math-field class="math-field" id="mf"></math-field>
+<p style="margin-top:8px">LaTeX源码：</p>
 <textarea class="wide" id="latexTxt"></textarea>
 </div>
 </div>
@@ -257,10 +293,10 @@ function renderQuestionTable(list){
         const tr = document.createElement('tr');
         tr.innerHTML = `
         <td>${item.no}</td>
-        <td><textarea class="wide q‑title">${escapeHtml(item.title)}</textarea></td>
-        <td><textarea class="wide q‑opt">${escapeHtml(JSON.stringify(item.options,null,2))}</textarea></td>
-        <td><input class="q‑ans" value="${escapeHtml(item.answer)}"></td>
-        <td><textarea class="wide q‑ana">${escapeHtml(item.analysis)}</textarea></td>
+        <td><textarea class="wide q-title">${escapeHtml(item.title)}</textarea></td>
+        <td><textarea class="wide q-opt">${escapeHtml(JSON.stringify(item.options,null,2))}</textarea></td>
+        <td><input class="q-ans" value="${escapeHtml(item.answer)}"></td>
+        <td><textarea class="wide q-ana">${escapeHtml(item.analysis)}</textarea></td>
         `;
         tbody.appendChild(tr);
     });
@@ -278,12 +314,12 @@ function readTableQuestions(){
     const rows = qWrap.querySelectorAll('tbody tr');
     const out = [];
     rows.forEach(r=>{
-        const title = r.querySelector('.q‑title').value;
-        const optRaw = r.querySelector('.q‑opt').value;
+        const title = r.querySelector('.q-title').value;
+        const optRaw = r.querySelector('.q-opt').value;
         let opts={};
         try{opts=JSON.parse(optRaw)}catch(e){}
-        const ans = r.querySelector('.q‑ans').value;
-        const ana = r.querySelector('.q‑ana').value;
+        const ans = r.querySelector('.q-ans').value;
+        const ana = r.querySelector('.q-ana').value;
         out.push({title,options:opts,answer:ans,analysis:ana});
     });
     return out;
@@ -304,7 +340,7 @@ exportBtn.onclick = ()=>{
     const blob = new Blob([md],{type:'text/markdown'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download="wsd‑export.md";
+    a.download="wsd-export.md";
     a.click();
 };
 </script>
