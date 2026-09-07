@@ -11,90 +11,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['wsd_file'])) {
     }
     $tmpPath = $uploadFile['tmp_name'];
 
-    /**
-     * WSD启发式解析 提取UTF-16LE
-     */
+    function readableChar(string $char): bool
+    {
+        return preg_match('/^[A-Za-z0-9 .,;:!?()\[\]{}+\-=\/\\"\'’“”<>|_\r\n\t]$/u', $char) === 1
+            || preg_match('/^[\x{3400}-\x{9FFF}]$/u', $char) === 1;
+    }
+
+    function textLength(string $value): int
+    {
+        preg_match_all('/./us', $value, $matches);
+        return count($matches[0]);
+    }
+
+    function extractUtf16Runs(string $data, string $encoding): array
+    {
+        $out = [];
+        $length = strlen($data);
+        for ($offset = 0; $offset < 2; $offset++) {
+            $run = '';
+            $chars = '';
+            for ($i = $offset; $i + 1 < $length; $i += 2) {
+                $pair = substr($data, $i, 2);
+                $char = @iconv($encoding, 'UTF-8//IGNORE', $pair);
+                if ($char !== false && readableChar($char)) {
+                    $run .= $pair;
+                    $chars .= $char;
+                } else {
+                    if (textLength($chars) >= 8) $out[] = trim($chars);
+                    $run = '';
+                    $chars = '';
+                }
+            }
+            if (textLength($chars) >= 8) $out[] = trim($chars);
+        }
+        return $out;
+    }
+
+    function extractAsciiRuns(string $data): array
+    {
+        preg_match_all('/[A-Za-z0-9][A-Za-z0-9 .,;:!?()\[\]{}+\-=\/\\"\'’“”<>|_]{7,}/u', $data, $matches);
+        $out = [];
+        foreach ($matches[0] as $value) {
+            $value = trim(preg_replace('/\s+/u', ' ', $value));
+            if (preg_match('/[A-Za-z]{3,}/', $value)) $out[] = $value;
+        }
+        return $out;
+    }
+
     function parseWsdHeuristic(string $filePath): array
     {
-        $fp = fopen($filePath, 'rb');
-        if (!$fp) return ['ok' => false, 'msg' => '打开文件失败'];
-        // EduEditer versions may place the legacy marker after a small header,
-        // so do not reject a file only because the marker is not at byte zero.
-        $magicExpect = "\x00WSTUDIO5";
-        $headBuf = fread($fp, 256);
-        if ($headBuf === false || strlen($headBuf) === 0) {
-            fclose($fp);
-            return ['ok' => false, 'msg' => '文件为空或无法读取'];
-        }
-        $markerPos = strpos($headBuf, $magicExpect);
-        $headerSkip = ($markerPos === false) ? 0 : $markerPos + strlen($magicExpect);
-        fseek($fp, 0);
-        $chunkSize = 8192;
-        $buffer = '';
-        $outputLines = [];
-        $headerSkipped = false;
-        $scanOffset = $headerSkip % 2;
-        while (!feof($fp)) {
-            $raw = fread($fp, $chunkSize);
-            if ($raw === false || $raw === '') continue;
-            $buffer .= $raw;
-            if (!$headerSkipped && ($headerSkip === 0 || strlen($buffer) >= $headerSkip)) {
-                if ($headerSkip > 0) $buffer = substr($buffer, $headerSkip);
-                $headerSkipped = true;
-            }
-            $processable = strlen($buffer) - 512;
-            if ($processable <= 0 && !feof($fp)) continue;
-            $scan = $processable > 0 ? substr($buffer, 0, $processable) : $buffer;
-            $buffer = $processable > 0 ? substr($buffer, $processable) : '';
-            $scanLen = strlen($scan);
-            for ($offset = $scanOffset; $offset < $scanOffset + 1; $offset++) {
-                $run = '';
-                for ($i = $offset; $i + 1 < $scanLen; $i += 2) {
-                    $unit = unpack('v', substr($scan, $i, 2))[1];
-                    $valid = ($unit === 9 || $unit === 10 || $unit === 13 || ($unit >= 32 && $unit !== 0xFFFE && $unit !== 0xFFFF));
-                    if (!$valid) {
-                        if (strlen($run) >= 4) {
-                            $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
-                            if ($str !== '') $outputLines[] = $str;
-                        }
-                        $run = '';
-                        continue;
-                    }
-                    $run .= substr($scan, $i, 2);
-                }
-                if (strlen($run) >= 4) {
-                    $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
-                    if ($str !== '') $outputLines[] = $str;
-                }
-            }
-        }
-        if ($buffer !== '') {
-            for ($offset = $scanOffset; $offset < $scanOffset + 1; $offset++) {
-                $run = '';
-                for ($i = $offset; $i + 1 < strlen($buffer); $i += 2) {
-                    $unit = unpack('v', substr($buffer, $i, 2))[1];
-                    if ($unit >= 32 || $unit === 9 || $unit === 10 || $unit === 13) {
-                        $run .= substr($buffer, $i, 2);
-                    } elseif (strlen($run) >= 4) {
-                        $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
-                        if ($str !== '') $outputLines[] = $str;
-                        $run = '';
-                    }
-                }
-                if (strlen($run) >= 4) {
-                    $str = trim((string) iconv('UTF-16LE', 'UTF-8//IGNORE', $run));
-                    if ($str !== '') $outputLines[] = $str;
-                }
-            }
-        }
-        fclose($fp);
-        $outputLines = array_values(array_unique($outputLines));
-        $rawText = implode("\n", $outputLines);
-        //文本清洗
+        $data = @file_get_contents($filePath);
+        if ($data === false || $data === '') return ['ok' => false, 'msg' => '文件为空或无法读取'];
+
+        // Text objects in EduEditer are commonly UTF-16BE, UTF-16LE, or ASCII.
+        // Extract only long readable runs; MathType/font/index blocks are discarded.
+        $runs = array_merge(
+            extractUtf16Runs($data, 'UTF-16BE'),
+            extractUtf16Runs($data, 'UTF-16LE'),
+            extractAsciiRuns($data)
+        );
+        $runs = array_values(array_unique(array_filter($runs, static function (string $value): bool {
+            if (preg_match('/^(Math Type|M Extra|Times New Roman|SimSun|宋体|FS Math Type|WSTUDIO5)$/iu', trim($value))) return false;
+            return preg_match('/[A-Za-z]{3,}/u', $value) === 1;
+        })));
+        $rawText = implode("\n", $runs);
         $clean = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $rawText);
-        $clean = preg_replace('/\n{3,}/', "\n\n", $clean);
         $clean = preg_replace('/[ \t]+/u', ' ', $clean);
-        return ['ok' => true, 'raw' => $rawText, 'clean' => $clean, 'headerDetected' => $headerSkip > 0];
+        $clean = preg_replace('/\n{3,}/', "\n\n", $clean);
+        return ['ok' => true, 'raw' => $rawText, 'clean' => $clean, 'headerDetected' => strpos($data, "\x00WSTUDIO5") !== false];
     }
 
     /**
@@ -108,6 +92,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['wsd_file'])) {
         foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '') continue;
+            // Some EduEditer dialogue documents store the question number separately.
+            if (preg_match('/^(\d+)$/', $line, $m)) {
+                if ($current !== null) $questions[] = $current;
+                $current = [
+                    'no' => $m[1], 'title' => '', 'options' => [],
+                    'answer' => '', 'analysis' => ''
+                ];
+                continue;
+            }
             //匹配题号 1. 2.
             if (preg_match('/^(\d+)[\.、]/u', $line, $m)) {
                 if ($current !== null) $questions[] = $current;
@@ -121,11 +114,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['wsd_file'])) {
                 continue;
             }
             if ($current === null) continue;
-            //A. B. C. D.
-            if (preg_match('/^([A-D])[\.、]/u', $line, $optm)) {
-                $optKey = $optm[1];
-                $optVal = preg_replace('/^([A-D])[\.、]/u', '', $line);
-                $current['options'][$optKey] = $optVal;
+            // A-D options may be written as A.xxx, A) xxx, or with tabs/spaces.
+            if (preg_match('/^([A-D])\s*[\.、)、:]\s*(.*)$/u', $line, $optm)) {
+                $current['options'][$optm[1]] = trim($optm[2]);
+                continue;
+            }
+            // Also accept several options placed on one physical line.
+            if (preg_match_all('/(?:^|\s)([A-D])\s*[\.、)、:]\s*(.*?)(?=\s+[A-D]\s*[\.、)、:]|$)/u', $line, $inline, PREG_SET_ORDER) >= 2) {
+                foreach ($inline as $optm) $current['options'][$optm[1]] = trim($optm[2]);
                 continue;
             }
             //【答案】
